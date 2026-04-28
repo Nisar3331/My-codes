@@ -1,0 +1,122 @@
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
+import json
+import requests
+
+
+@dataclass
+class AirflowRequest:
+    method: str
+    path: str
+    params: Optional[Dict[str, Any]] = None
+    json: Optional[Dict[str, Any]] = None
+
+
+class AirflowClientBase:
+    def request(self, req: AirflowRequest) -> Dict[str, Any]:
+        raise NotImplementedError
+
+
+class SelfHostedAirflowClient(AirflowClientBase):
+    """Self-hosted Airflow: JWT token via POST /auth/token."""
+
+    def __init__(self, base_url: str, username: str, password: str, api_prefix: str = '/api/v1'):
+        self.base_url = base_url.rstrip('/')
+        self.username = username
+        self.password = password
+        self.api_prefix = api_prefix
+        self._token: Optional[str] = None
+
+    def _get_token(self) -> str:
+        if self._token:
+            return self._token
+        url = f"{self.base_url}/auth/token"
+        resp = requests.post(url, json={"username": self.username, "password": self.password}, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        self._token = data.get('access_token')
+        if not self._token:
+            raise RuntimeError('Airflow token response missing access_token')
+        return self._token
+
+    def request(self, req: AirflowRequest) -> Dict[str, Any]:
+        token = self._get_token()
+        url = f"{self.base_url}{self.api_prefix}{req.path}"
+        headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+        resp = requests.request(req.method, url, headers=headers, params=req.params, json=req.json, timeout=30)
+        resp.raise_for_status()
+        return resp.json() if resp.text else {}
+
+
+class ComposerAirflowClient(AirflowClientBase):
+    """Cloud Composer: call IAP-protected Airflow with OIDC ID token."""
+
+    def __init__(self, base_url: str, audience: str, api_prefix: str = '/api/v1'):
+        self.base_url = base_url.rstrip('/')
+        self.audience = audience
+        self.api_prefix = api_prefix
+
+    def _id_token(self) -> str:
+        from google.auth.transport.requests import Request
+        from google.oauth2 import id_token
+        return id_token.fetch_id_token(Request(), self.audience)
+
+    def request(self, req: AirflowRequest) -> Dict[str, Any]:
+        tok = self._id_token()
+        url = f"{self.base_url}{self.api_prefix}{req.path}"
+        headers = {'Authorization': f'Bearer {tok}', 'Content-Type': 'application/json'}
+        resp = requests.request(req.method, url, headers=headers, params=req.params, json=req.json, timeout=30)
+        resp.raise_for_status()
+        return resp.json() if resp.text else {}
+
+
+class MwaaAirflowClient(AirflowClientBase):
+    """Amazon MWAA: use boto3 mwaa.invoke_rest_api."""
+
+    def __init__(self, environment_name: str, region: str):
+        import boto3
+        self.environment_name = environment_name
+        self.client = boto3.client('mwaa', region_name=region)
+
+    def request(self, req: AirflowRequest) -> Dict[str, Any]:
+        body = None
+        if req.json is not None:
+            body = json.dumps(req.json)
+        resp = self.client.invoke_rest_api(
+            Name=self.environment_name,
+            Path=req.path if req.path.startswith('/') else '/' + req.path,
+            Method=req.method,
+            Body=body
+        )
+        code = resp.get('RestApiStatusCode')
+        if code and int(code) >= 400:
+            raise RuntimeError({'status': code, 'response': resp.get('RestApiResponse')})
+        raw = resp.get('RestApiResponse')
+        if not raw:
+            return {}
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {'raw': raw}
+
+
+def build_airflow_client(instance: Dict[str, Any]) -> AirflowClientBase:
+    """Build appropriate Airflow client based on platform variant and auth method."""
+    variant = instance.get('variant', 'self_hosted')
+    auth = (instance.get('auth') or {})
+    method = auth.get('method')
+
+    if variant == 'mwaa':
+        if method != 'aws_invoke_rest_api':
+            raise ValueError('MWAA requires auth.method=aws_invoke_rest_api')
+        return MwaaAirflowClient(environment_name=instance['environment_name'], region=instance.get('region', 'us-east-1'))
+
+    if variant == 'composer':
+        if method != 'iap_oidc':
+            raise ValueError('Composer requires auth.method=iap_oidc')
+        return ComposerAirflowClient(base_url=instance['base_url'], audience=auth['audience'])
+
+    if method != 'jwt_password':
+        raise ValueError('Self-hosted requires auth.method=jwt_password')
+    return SelfHostedAirflowClient(base_url=instance['base_url'], username=auth['username'], password=auth['password'])

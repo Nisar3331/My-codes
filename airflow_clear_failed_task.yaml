@@ -1,0 +1,49 @@
+from __future__ import annotations
+from typing import Dict, Any
+from azure.identity import (
+    ManagedIdentityCredential,
+    ClientSecretCredential,
+    DefaultAzureCredential,
+    ChainedTokenCredential
+)
+
+
+def get_azure_credential(auth: Dict[str, Any]):
+    """Get Azure credential with support for multiple auth methods.
+
+    Supports:
+      - default: DefaultAzureCredential (env vars, managed identity, CLI, etc.)
+      - managed_identity: Explicit managed identity (client_id optional)
+      - client_secret: Service principal with client_id + client_secret
+    """
+    method = auth.get('method', 'default')
+
+    if method == 'default':
+        return DefaultAzureCredential()
+
+    if method == 'managed_identity':
+        # Managed identity (Azure VMs, App Service, etc.)
+        client_id = auth.get('client_id')  # Optional: specify which identity if multiple
+        return ManagedIdentityCredential(client_id=client_id)
+
+    if method == 'client_secret':
+        # Service principal
+        tenant_id = auth.get('tenant_id')
+        client_id = auth.get('client_id')
+        client_secret = auth.get('client_secret')
+        if not all([tenant_id, client_id, client_secret]):
+            raise ValueError('client_secret method requires tenant_id, client_id, client_secret')
+        return ClientSecretCredential(
+            tenant_id=tenant_id,
+            client_id=client_id,
+            client_secret=client_secret
+        )
+
+    raise ValueError(f"Unsupported Azure auth method: {method}")
+
+
+def get_arm_token(auth: Dict[str, Any]) -> str:
+    """Get ARM (Azure Resource Manager) access token."""
+    cred = get_azure_credential(auth)
+    tok = cred.get_token('https://management.azure.com/.default')
+    return tok.token

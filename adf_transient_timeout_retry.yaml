@@ -1,0 +1,104 @@
+import re
+from datetime import datetime
+from typing import List, Optional
+from .base import PlatformPoller
+from .aws_auth import get_aws_client
+
+
+class CloudWatchPoller(PlatformPoller):
+    """Poll AWS CloudWatch Logs for Glue job failures.
+
+    Supports auth methods:
+      - default: AWS SDK credential chain
+      - profile: Named profile from ~/.aws/credentials
+      - assume_role: Cross-account/cross-role via STS
+      - explicit: Explicit access_key_id + secret_access_key
+    """
+
+    FAILURE_PATTERNS = [
+        ("Timeout", r"(timeout|timed out|exceeds|timeout waiting)"),
+        ("OutOfMemory", r"(out of memory|oom|memory exceeded)"),
+        ("AccessDenied", r"(access denied|permission denied|accessdenied|not authorized)"),
+        ("ThrottlingException", r"(throttl|rate limit|request limit)"),
+        ("Failed", r"(failed|error|exception|fatal)"),
+    ]
+
+    def __init__(self, instance: dict):
+        super().__init__(instance)
+        self.instance = instance
+        self.region = instance.get("region") or instance.get('meta', {}).get('region') or 'us-east-1'
+        self.client = get_aws_client("logs", instance)
+        self.log_group = instance.get("log_group") or f"/aws-glue/{instance.get('name', 'default')}"
+
+    def get_logs(self, since: datetime, until: datetime) -> List[str]:
+        """Fetch logs from CloudWatch between timestamps."""
+        try:
+            since_ms = int(since.timestamp() * 1000)
+            until_ms = int(until.timestamp() * 1000)
+
+            # Query CloudWatch Logs Insights for recent errors
+            query = """
+                fields @timestamp, @message, @logStream
+                | filter @message like /error|Error|ERROR|failed|Failed|timeout|Timeout/
+                | sort @timestamp desc
+                | limit 100
+            """
+
+            response = self.client.start_query(
+                logGroupName=self.log_group,
+                startTime=since_ms,
+                endTime=until_ms,
+                queryString=query,
+            )
+
+            query_id = response["queryId"]
+
+            # Poll for query completion (up to 30 seconds)
+            import time
+            for _ in range(30):
+                result = self.client.get_query_results(queryId=query_id)
+                if result["status"] == "Complete":
+                    logs = []
+                    for record in result.get("results", []):
+                        message = ""
+                        for field in record:
+                            if field["field"] == "@message":
+                                message = field["value"]
+                                break
+                        if message:
+                            logs.append(message)
+                    return logs
+                time.sleep(1)
+
+            return []
+
+        except Exception as e:
+            print(f"Error querying CloudWatch logs: {e}")
+            return []
+
+    def detect_failures(self, logs: List[str]) -> Optional[dict]:
+        """Detect failures in CloudWatch logs."""
+        if not logs:
+            return None
+
+        full_text = "\n".join(logs).lower()
+
+        # Try to match failure patterns
+        for failure_type, pattern in self.FAILURE_PATTERNS:
+            if re.search(pattern, full_text, re.IGNORECASE):
+                return {
+                    "failure_signature": failure_type,
+                    "error_text": logs[0],  # First log line as representative
+                    "run_id": self._extract_run_id(logs),
+                }
+
+        return None
+
+    def _extract_run_id(self, logs: List[str]) -> str:
+        """Extract run_id from logs (Glue job run ID format: jr_xxxx)."""
+        for log in logs:
+            match = re.search(r"(jr_[a-f0-9]{32})", log, re.IGNORECASE)
+            if match:
+                return match.group(1)
+        # Fallback: use timestamp-based ID
+        return f"glue-run-{int(datetime.now().timestamp())}"

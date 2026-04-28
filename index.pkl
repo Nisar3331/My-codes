@@ -1,0 +1,97 @@
+import re
+from datetime import datetime
+from typing import List, Optional
+from .base import PlatformPoller
+from .gcp_auth import get_gcp_logging_client
+
+
+class GcpCloudLoggingPoller(PlatformPoller):
+    """Poll GCP Cloud Logging for Cloud Composer (Airflow) failures.
+
+    Supports auth methods:
+      - default: Application Default Credentials (ADC)
+      - service_account_key: Path to service account JSON key file
+    """
+
+    FAILURE_PATTERNS = [
+        ("Timeout", r"(timeout|timed out|exceeds|timeout waiting)"),
+        ("OutOfMemory", r"(out of memory|oom|memory exceeded)"),
+        ("AccessDenied", r"(access denied|permission denied|forbidden|not authorized)"),
+        ("ThrottlingException", r"(throttl|rate limit|request limit)"),
+        ("Failed", r"(failed|error|exception|fatal)"),
+    ]
+
+    def __init__(self, instance: dict):
+        super().__init__(instance)
+        self.project_id = instance.get("project_id") or instance.get('meta', {}).get('project_id')
+        self.composer_environment = instance.get("composer_environment") or instance.get('meta', {}).get('composer_environment')
+        self.client = get_gcp_logging_client(instance)
+
+    def get_logs(self, since: datetime, until: datetime) -> List[str]:
+        """Fetch logs from Cloud Logging for Cloud Composer."""
+        try:
+            since_str = since.isoformat() + "Z"
+            until_str = until.isoformat() + "Z"
+
+            # Query for Airflow task failures in Cloud Composer
+            filter_str = f"""
+                resource.type="cloud_composer_environment"
+                resource.labels.environment_name="{self.composer_environment}"
+                severity >= ERROR
+                timestamp>"{since_str}"
+                timestamp<"{until_str}"
+                (
+                    "Task failed" OR
+                    "error" OR
+                    "failed" OR
+                    "timeout" OR
+                    "exception"
+                )
+            """
+
+            entries = self.client.list_entries(filter_=filter_str, page_size=100)
+
+            logs = []
+            for entry in entries:
+                if entry.payload:
+                    logs.append(str(entry.payload))
+
+            return logs
+
+        except Exception as e:
+            print(f"Error querying GCP Cloud Logging: {e}")
+            return []
+
+    def detect_failures(self, logs: List[str]) -> Optional[dict]:
+        """Detect failures in Cloud Logging logs."""
+        if not logs:
+            return None
+
+        full_text = "\n".join(logs).lower()
+
+        # Try to match failure patterns
+        for failure_type, pattern in self.FAILURE_PATTERNS:
+            if re.search(pattern, full_text, re.IGNORECASE):
+                return {
+                    "failure_signature": failure_type,
+                    "error_text": logs[0],
+                    "run_id": self._extract_run_id(logs),
+                }
+
+        return None
+
+    def _extract_run_id(self, logs: List[str]) -> str:
+        """Extract run_id from logs (Airflow DAG/task run format)."""
+        for log in logs:
+            # Airflow DAG run format
+            match = re.search(r"dag_id['\"]?\s*:\s*['\"]?([a-zA-Z0-9_-]+)", log, re.IGNORECASE)
+            if match:
+                dag_id = match.group(1)
+                # Extract execution date
+                exec_match = re.search(r"execution_date['\"]?\s*:\s*['\"]?([^'\"]+)", log)
+                if exec_match:
+                    return f"{dag_id}-{exec_match.group(1)}"
+                return f"{dag_id}-{int(datetime.now().timestamp())}"
+
+        # Fallback
+        return f"composer-run-{int(datetime.now().timestamp())}"

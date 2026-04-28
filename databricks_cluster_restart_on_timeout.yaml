@@ -1,0 +1,38 @@
+from abc import ABC, abstractmethod
+from datetime import datetime
+from typing import List, Optional
+
+
+class PlatformPoller(ABC):
+    """Abstract base class for platform-specific log pollers."""
+
+    def __init__(self, instance: dict):
+        """
+        Args:
+            instance: Instance config dict with auth, region, workspace_url, etc.
+        """
+        self.instance = instance
+
+    @abstractmethod
+    def get_logs(self, since: datetime, until: datetime) -> List[str]:
+        """
+        Fetch logs from platform between timestamps.
+
+        Returns:
+            List of log entries as strings
+        """
+        pass
+
+    @abstractmethod
+    def detect_failures(self, logs: List[str]) -> Optional[dict]:
+        """
+        Analyze logs to detect failures.
+
+        Returns:
+            dict with keys:
+                - 'failure_signature': Error type/category (e.g., "Timeout", "AccessDenied")
+                - 'error_text': Raw error message from logs
+                - 'run_id': Unique run identifier (if detectable from logs)
+            or None if no failure detected
+        """
+        pass

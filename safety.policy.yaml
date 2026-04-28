@@ -1,0 +1,61 @@
+from __future__ import annotations
+from typing import Dict, Any, Optional
+import boto3
+from botocore.exceptions import ClientError
+
+
+def get_aws_client(service: str, instance: Dict[str, Any], **kwargs) -> Any:
+    """Get AWS client with support for multiple auth methods.
+
+    Supports:
+      - default: AWS SDK credential chain (env vars, instance profile, ~/.aws/credentials)
+      - profile: Named profile from ~/.aws/credentials
+      - assume_role: Cross-account/cross-role via STS AssumeRole
+      - explicit: Explicit access_key_id + secret_access_key
+    """
+    auth = instance.get('auth') or {}
+    method = auth.get('method', 'default')
+    region = instance.get('region') or instance.get('meta', {}).get('region') or 'us-east-1'
+
+    if method == 'default':
+        # Use default credential chain
+        return boto3.client(service, region_name=region, **kwargs)
+
+    if method == 'profile':
+        # Use named profile from ~/.aws/credentials
+        session = boto3.Session(profile_name=auth.get('profile_name', 'default'))
+        return session.client(service, region_name=region, **kwargs)
+
+    if method == 'assume_role':
+        # Assume role via STS (cross-account or cross-role)
+        sts_client = boto3.client('sts', region_name=region)
+        role_arn = auth.get('role_arn')
+        session_name = auth.get('session_name', 'self-healing-poller')
+        duration = auth.get('duration_seconds', 3600)
+
+        try:
+            response = sts_client.assume_role(
+                RoleArn=role_arn,
+                RoleSessionName=session_name,
+                DurationSeconds=duration
+            )
+            credentials = response['Credentials']
+            session = boto3.Session(
+                aws_access_key_id=credentials['AccessKeyId'],
+                aws_secret_access_key=credentials['SecretAccessKey'],
+                aws_session_token=credentials['SessionToken']
+            )
+            return session.client(service, region_name=region, **kwargs)
+        except ClientError as e:
+            raise ValueError(f"Failed to assume role {role_arn}: {e}")
+
+    if method == 'explicit':
+        # Explicit credentials (not recommended for production)
+        session = boto3.Session(
+            aws_access_key_id=auth.get('access_key_id'),
+            aws_secret_access_key=auth.get('secret_access_key'),
+            region_name=region
+        )
+        return session.client(service, region_name=region, **kwargs)
+
+    raise ValueError(f"Unsupported AWS auth method: {method}")

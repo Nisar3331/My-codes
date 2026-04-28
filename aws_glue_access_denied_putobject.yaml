@@ -1,0 +1,98 @@
+import re
+from datetime import datetime, timedelta
+from typing import List, Optional
+from azure.monitor.query import LogsQueryClient
+from .base import PlatformPoller
+from .azure_auth import get_azure_credential
+
+
+class AzureLogAnalyticsPoller(PlatformPoller):
+    """Poll Azure Log Analytics for Data Factory / Databricks failures.
+
+    Supports auth methods:
+      - default: DefaultAzureCredential (env vars, managed identity, CLI, etc.)
+      - managed_identity: Explicit managed identity (optional client_id)
+      - client_secret: Service principal with client_id + client_secret
+    """
+
+    FAILURE_PATTERNS = [
+        ("Timeout", r"(timeout|timed out|exceeds|timeout waiting)"),
+        ("OutOfMemory", r"(out of memory|oom|memory exceeded)"),
+        ("AccessDenied", r"(access denied|permission denied|forbidden|not authorized)"),
+        ("ThrottlingException", r"(throttl|rate limit|request limit)"),
+        ("Failed", r"(failed|error|exception|fatal)"),
+    ]
+
+    def __init__(self, instance: dict):
+        super().__init__(instance)
+        self.workspace_id = instance.get("workspace_id") or instance.get('meta', {}).get('workspace_id')
+        self.subscription_id = instance.get("subscription_id") or instance.get('meta', {}).get('subscription_id')
+        self.tenant_id = instance.get("tenant_id") or instance.get('meta', {}).get('tenant_id')
+
+        auth = instance.get('auth') or instance.get('meta', {}).get('auth') or {}
+        credential = get_azure_credential(auth)
+        self.client = LogsQueryClient(credential)
+
+    def get_logs(self, since: datetime, until: datetime) -> List[str]:
+        """Fetch logs from Azure Log Analytics between timestamps."""
+        try:
+            # KQL query for recent errors (adjust table names based on ADF/Databricks)
+            duration = (until - since).total_seconds()
+            query = f"""
+                (ADFActivityRun or ADFPipelineRun or DatabricksJobsCluster or DatabricksJobsRun)
+                | where TimeGenerated >= ago({int(duration)}s)
+                | where Level in ('Error', 'Critical') or Result has 'Failed'
+                | project TimeGenerated, Message, Result, OperationName
+                | sort by TimeGenerated desc
+                | limit 100
+            """
+
+            result = self.client.query_workspace(
+                workspace_id=self.workspace_id,
+                query=query,
+                timespan=timedelta(hours=1),
+            )
+
+            logs = []
+            for row in result.tables[0].rows if result.tables else []:
+                if row:
+                    logs.append(str(row))
+
+            return logs
+
+        except Exception as e:
+            print(f"Error querying Azure Log Analytics: {e}")
+            return []
+
+    def detect_failures(self, logs: List[str]) -> Optional[dict]:
+        """Detect failures in Azure logs."""
+        if not logs:
+            return None
+
+        full_text = "\n".join(logs).lower()
+
+        # Try to match failure patterns
+        for failure_type, pattern in self.FAILURE_PATTERNS:
+            if re.search(pattern, full_text, re.IGNORECASE):
+                return {
+                    "failure_signature": failure_type,
+                    "error_text": logs[0],
+                    "run_id": self._extract_run_id(logs),
+                }
+
+        return None
+
+    def _extract_run_id(self, logs: List[str]) -> str:
+        """Extract run_id from logs (ADF/Databricks formats)."""
+        for log in logs:
+            # ADF pipeline run ID format
+            match = re.search(r"RunId['\"]?\s*:\s*['\"]?([a-f0-9-]+)", log, re.IGNORECASE)
+            if match:
+                return match.group(1)
+            # Databricks run ID format
+            match = re.search(r"run_id['\"]?\s*:\s*['\"]?(\d+)", log, re.IGNORECASE)
+            if match:
+                return f"dbx-run-{match.group(1)}"
+
+        # Fallback
+        return f"azure-run-{int(datetime.now().timestamp())}"
