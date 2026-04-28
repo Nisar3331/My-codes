@@ -1,0 +1,94 @@
+import re
+from datetime import datetime
+from typing import List, Optional
+from .base import PlatformPoller
+from .airflow_client import build_airflow_client, AirflowRequest
+
+
+class AirflowLogsPoller(PlatformPoller):
+    """Poll Airflow task logs for failures (self-hosted, MWAA, Cloud Composer).
+
+    Supports auth methods:
+      - Self-Hosted: auth.method=jwt_password (username + password)
+      - MWAA: auth.method=aws_invoke_rest_api (uses boto3 mwaa.invoke_rest_api)
+      - Cloud Composer: auth.method=iap_oidc (OIDC token + audience)
+    """
+
+    FAILURE_PATTERNS = [
+        ("Timeout", r"(timeout|timed out|exceeds|timeout waiting)"),
+        ("OutOfMemory", r"(out of memory|oom|memory exceeded)"),
+        ("AccessDenied", r"(access denied|permission denied|forbidden|not authorized)"),
+        ("TaskFailed", r"(task failed|failed\s+\d+|task is not ready)"),
+        ("Failed", r"(failed|error|exception|fatal)"),
+    ]
+
+    def __init__(self, instance: dict):
+        super().__init__(instance)
+        self.instance = instance
+        self.client = build_airflow_client(instance)
+        self.instance_name = instance.get("name", "airflow")
+
+    def get_logs(self, since: datetime, until: datetime) -> List[str]:
+        """Fetch failed DAG runs from Airflow API."""
+        try:
+            # Query for recent failed DAG runs
+            response = self.client.request(AirflowRequest(
+                'GET',
+                '/dags/~/dagRuns',
+                params={'limit': 20, 'state': 'failed'}
+            ))
+
+            dag_runs = response.get("dag_runs", [])
+            logs = []
+
+            for run in dag_runs:
+                if run.get("state") == "failed":
+                    # Fetch task instances for this run to get error details
+                    run_id = run.get("dag_run_id")
+                    dag_id = run.get("dag_id")
+                    try:
+                        task_response = self.client.request(AirflowRequest(
+                            'GET',
+                            f'/dags/{dag_id}/dagRuns/{run_id}/taskInstances',
+                            params={'limit': 10, 'state': 'failed'}
+                        ))
+                        failed_tasks = task_response.get("task_instances", [])
+                        for task in failed_tasks:
+                            log_msg = f"DAG {dag_id} task {task.get('task_id')} failed: {task.get('note', 'No details')}"
+                            logs.append(log_msg)
+                    except Exception:
+                        logs.append(f"DAG {dag_id} run {run_id} failed")
+
+            return logs
+
+        except Exception as e:
+            print(f"Error querying Airflow logs: {e}")
+            return []
+
+    def detect_failures(self, logs: List[str]) -> Optional[dict]:
+        """Detect failures in Airflow logs."""
+        if not logs:
+            return None
+
+        full_text = "\n".join(logs).lower()
+
+        for failure_type, pattern in self.FAILURE_PATTERNS:
+            if re.search(pattern, full_text, re.IGNORECASE):
+                return {
+                    "failure_signature": failure_type,
+                    "error_text": logs[0],
+                    "run_id": self._extract_run_id(logs),
+                }
+
+        return None
+
+    def _extract_run_id(self, logs: List[str]) -> str:
+        """Extract run_id from logs (DAG run ID format)."""
+        for log in logs:
+            match = re.search(r"DAG\s+([a-zA-Z0-9_-]+)\s+.*task\s+([a-zA-Z0-9_-]+)", log)
+            if match:
+                dag_id = match.group(1)
+                task_id = match.group(2)
+                return f"{dag_id}-{task_id}-{int(datetime.now().timestamp())}"
+
+        return f"airflow-run-{int(datetime.now().timestamp())}"

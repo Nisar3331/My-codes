@@ -1,0 +1,230 @@
+import logging
+import json
+from datetime import datetime
+from backend.persistence import (
+    create_remediation,
+    update_remediation,
+    get_polling_config,
+    get_notification_config,
+)
+from backend.orchestration.graph import build_graph
+from backend.models.schemas import FailureEvent
+from backend.safety.checks import evaluate_plan
+from backend.integrations.aws_glue.executor import AwsGlueExecutor
+from backend.integrations.azure_data_factory.executor import AzureDataFactoryExecutor
+from backend.integrations.azure_databricks.executor import AzureDatabricksExecutor
+from backend.integrations.gcp_composer.executor import GcpComposerExecutor
+from backend.integrations.airflow.executor import AirflowExecutor
+
+logger = logging.getLogger(__name__)
+
+EXECUTOR_MAP = {
+    "aws_glue": AwsGlueExecutor,
+    "azure_data_factory": AzureDataFactoryExecutor,
+    "azure_databricks": AzureDatabricksExecutor,
+    "gcp_composer": GcpComposerExecutor,
+    "airflow": AirflowExecutor,
+}
+
+
+def execute_auto_remediation(
+    platform: str,
+    instance_name: str,
+    failure: dict,
+    instance: dict,
+) -> None:
+    """
+    Auto-execute remediation for detected failure.
+
+    Args:
+        platform: Platform name (aws_glue, etc.)
+        instance_name: Instance name
+        failure: dict with keys: failure_signature, error_text, run_id
+        instance: Instance config from integrations.enc
+    """
+    try:
+        # Get polling config to check auto-execute policy
+        polling_config = get_polling_config(platform, instance_name)
+        if not polling_config:
+            logger.warning(f"No polling config for {platform}/{instance_name}")
+            return
+
+        if not polling_config.get("enabled"):
+            logger.info(f"Polling disabled for {platform}/{instance_name}")
+            return
+
+        # Create failure event
+        run_id = failure.get("run_id", f"detected-{int(datetime.now().timestamp())}")
+        event = FailureEvent(
+            platform=platform,
+            instance_name=instance_name,
+            run_id=run_id,
+            occurred_at=datetime.utcnow().isoformat() + "Z",
+            payload={
+                "failure_signature": failure["failure_signature"],
+                "error_text": failure.get("error_text", ""),
+                "detected_via": "polling",
+            },
+        )
+
+        # Run healing workflow
+        logger.info(f"Running healing workflow for {platform}/{instance_name}/{run_id}")
+        state = {
+            'platform': platform,
+            'instance': instance,
+            'run_id': run_id,
+        }
+        graph = build_graph()
+        result = graph.invoke(state)
+
+        # Store remediation in database
+        remediation_id = create_remediation(
+            platform=platform,
+            instance_name=instance_name,
+            run_id=run_id,
+            failure_signature=failure["failure_signature"],
+            classification=result.get("classification", {}),
+            plan=result.get("plan", {}),
+            safety_eval=result.get("safety", {}),
+            detected_at=datetime.now(),
+        )
+
+        logger.info(f"Created remediation record: {remediation_id}")
+
+        # Extract results
+        plan = result.get("plan", {})
+        safety_eval = result.get("safety", {})
+
+        # Decision: auto-execute?
+        auto_execute_low_risk = polling_config.get("auto_execute_low_risk", False)
+        should_auto_execute = (
+            auto_execute_low_risk
+            and safety_eval.get("allowlisted", False)
+            and safety_eval.get("risk") == "LOW"
+            and not plan.get("requires_approval", False)
+        )
+
+        if should_auto_execute:
+            logger.info(f"Auto-executing plan for {run_id} (LOW risk + allowlisted)")
+            exec_result = _execute_plan(platform, instance, run_id, plan)
+
+            # Update remediation status
+            update_remediation(
+                remediation_id,
+                executed=True,
+                execution_status="SUCCESS" if exec_result.get("success") else "FAILED",
+                execution_result=exec_result,
+                is_still_failing=not exec_result.get("success"),
+            )
+
+            # Check if still failing and send email
+            if not exec_result.get("success"):
+                _send_failure_notification(
+                    platform, instance_name, failure["failure_signature"], remediation_id
+                )
+        else:
+            # Store as PENDING, waiting for approval
+            logger.info(f"Plan for {run_id} stored as PENDING (awaiting approval)")
+            update_remediation(
+                remediation_id,
+                executed=False,
+                execution_status="PENDING",
+                is_still_failing=True,  # Assume still failing until proven otherwise
+            )
+            # Send email that manual approval is needed
+            _send_pending_notification(platform, instance_name, remediation_id)
+
+    except Exception as e:
+        logger.error(f"Error executing auto remediation: {e}", exc_info=True)
+
+
+def _execute_plan(platform: str, instance: dict, run_id: str, plan: dict) -> dict:
+    """Execute remediation plan using platform-specific executor."""
+    try:
+        Executor = EXECUTOR_MAP.get(platform)
+        if not Executor:
+            return {"success": False, "error": f"No executor for {platform}"}
+
+        executor = Executor(instance)
+        steps = plan.get("steps", [])
+
+        results = []
+        for step in steps:
+            try:
+                result = executor.execute_step(instance, run_id, step)
+                results.append(result)
+                logger.info(f"Executed step {step.get('action')} for {run_id}: {result}")
+            except Exception as e:
+                logger.error(f"Error executing step {step.get('action')}: {e}")
+                results.append({"action": step.get("action"), "success": False, "error": str(e)})
+
+        # Validate execution
+        validation = executor.validate(instance, run_id)
+
+        # Consider success if all steps succeeded and validation passed
+        all_succeeded = all(r.get("success", False) for r in results)
+        success = all_succeeded and validation.get("success", True)
+
+        return {
+            "success": success,
+            "steps": results,
+            "validation": validation,
+        }
+
+    except Exception as e:
+        logger.error(f"Error executing plan: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
+def _send_failure_notification(
+    platform: str, instance_name: str, failure_signature: str, remediation_id: str
+) -> None:
+    """Send email notification for still-failing remediation."""
+    try:
+        notification_config = get_notification_config(platform, instance_name)
+        if not notification_config or not notification_config.get("enabled"):
+            logger.debug(f"Notifications disabled for {platform}/{instance_name}")
+            return
+
+        recipients = notification_config.get("recipients", [])
+        if not recipients:
+            logger.debug(f"No recipients configured for {platform}/{instance_name}")
+            return
+
+        # Import here to avoid circular imports
+        from backend.notifications import send_failure_email
+
+        send_failure_email(
+            recipients=recipients,
+            platform=platform,
+            instance_name=instance_name,
+            failure_signature=failure_signature,
+            remediation_id=remediation_id,
+        )
+
+    except Exception as e:
+        logger.error(f"Error sending failure notification: {e}", exc_info=True)
+
+
+def _send_pending_notification(platform: str, instance_name: str, remediation_id: str) -> None:
+    """Send email notification that manual approval is needed."""
+    try:
+        notification_config = get_notification_config(platform, instance_name)
+        if not notification_config or not notification_config.get("enabled"):
+            return
+
+        recipients = notification_config.get("recipients", [])
+        if not recipients:
+            return
+
+        from backend.notifications import send_pending_email
+
+        send_pending_email(
+            recipients=recipients,
+            platform=platform,
+            instance_name=instance_name,
+            remediation_id=remediation_id,
+        )
+
+    except Exception as e:
+        logger.error(f"Error sending pending notification: {e}", exc_info=True)
