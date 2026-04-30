@@ -3,6 +3,15 @@
   ADF Error Catalog
   Defines all known pipeline errors, their causes,
   impacts, and auto-resolution strategies.
+
+  HOW TO ADD A NEW ERROR:
+  ───────────────────────
+  1. Add a new AdfError() block below ADF-006
+  2. Increment error_code  (ADF-007, ADF-008 ...)
+  3. Choose a unique resolution_action string
+  4. Add handler method in error_resolver.py
+  5. Register it in the dispatch table in resolve()
+  6. Add a unit test in tests/test_pipeline.py
 =======================================================
 """
 
@@ -19,15 +28,16 @@ class AdfError:
     main_cause: str
     business_impact: str
     troubleshooting_steps: List[str]
-    keywords: List[str]                   # Used by LLM for matching
+    keywords: List[str]           # Used by LLM keyword fallback for matching
     auto_resolvable: bool = True
-    resolution_action: str = ""           # What the resolver will do
-    severity: str = "HIGH"                # HIGH | MEDIUM | LOW
+    resolution_action: str = ""   # Must match a key in error_resolver.py dispatch table
+    severity: str = "HIGH"        # HIGH | MEDIUM | LOW
 
 
 # ── Full Error Catalog ───────────────────────────────────────────────────────
 ADF_ERROR_CATALOG: List[AdfError] = [
 
+    # ── ADF-001 ───────────────────────────────────────────────────────────────
     AdfError(
         error_code="ADF-001",
         error_name="Linked Service Connection Failure",
@@ -48,12 +58,15 @@ ADF_ERROR_CATALOG: List[AdfError] = [
             "connect", "connection", "credentials", "sql database",
             "storage account", "linked service", "secret", "firewall",
             "private endpoint", "integration runtime", "authentication",
+            "sqlfailedtoconnect", "cannot connect", "login failed",
+            "server provided routing", "timeout expired", "check the linked service",
         ],
         auto_resolvable=True,
         resolution_action="refresh_linked_service_credentials",
         severity="HIGH",
     ),
 
+    # ── ADF-002 ───────────────────────────────────────────────────────────────
     AdfError(
         error_code="ADF-002",
         error_name="Copy Activity Failed Due to Schema Mismatch",
@@ -80,6 +93,7 @@ ADF_ERROR_CATALOG: List[AdfError] = [
         severity="HIGH",
     ),
 
+    # ── ADF-003 ───────────────────────────────────────────────────────────────
     AdfError(
         error_code="ADF-003",
         error_name="File Not Found in Source Path",
@@ -99,13 +113,16 @@ ADF_ERROR_CATALOG: List[AdfError] = [
         keywords=[
             "file not found", "does not exist", "path", "blob",
             "adls", "sftp", "folder", "filename", "trigger", "upstream",
-            "missing file", "source path",
+            "missing file", "source path", "usererrorsourceblobnotexist",
+            "required blob is missing", "blob is missing", "404", "not found",
+            "containername", "blob storage",
         ],
         auto_resolvable=True,
         resolution_action="validate_source_path_and_wait_for_file",
         severity="MEDIUM",
     ),
 
+    # ── ADF-004 ───────────────────────────────────────────────────────────────
     AdfError(
         error_code="ADF-004",
         error_name="Pipeline Timeout Error",
@@ -132,6 +149,7 @@ ADF_ERROR_CATALOG: List[AdfError] = [
         severity="HIGH",
     ),
 
+    # ── ADF-005 ───────────────────────────────────────────────────────────────
     AdfError(
         error_code="ADF-005",
         error_name="Stored Procedure or SQL Script Failure",
@@ -157,6 +175,8 @@ ADF_ERROR_CATALOG: List[AdfError] = [
         resolution_action="retry_sp_with_dedup_and_deadlock_handling",
         severity="HIGH",
     ),
+
+    # ── ADF-006 ── Real error from pf-observability-datafactory (Apr 2026) ────
     AdfError(
         error_code="ADF-006",
         error_name="Parquet Invalid Column Name",
@@ -165,37 +185,47 @@ ADF_ERROR_CATALOG: List[AdfError] = [
             "these characters: [,;{}()\\n\\t=]"
         ),
         main_cause=(
-            "Source data contains column names with special characters "
-            "that Parquet format does not allow: [,;{}()\\n\\t=]. "
-            "Common causes: SQL views with calculated columns, CSV files "
-            "with brackets in headers, or Excel exports with formula names."
+            "Source data contains column names with special characters that "
+            "Parquet format does not allow: [,;{}()\\n\\t=]. "
+            "Common causes: SQL views with calculated or aliased columns, "
+            "CSV files with brackets or semicolons in headers, or Excel exports "
+            "with formula-based column names."
         ),
         business_impact=(
-            "Copy activity fails before writing any data to the Parquet "
-            "landing folder. Downstream reports and transforms are blocked."
+            "Copy Activity fails before writing any data to the Parquet landing "
+            "folder. All downstream transforms, reports, and dependent pipelines "
+            "are blocked until the column name is fixed."
         ),
         troubleshooting_steps=[
-            "Identify which column name contains the invalid character",
+            "Identify which column name contains the invalid Parquet character",
             "Add explicit column mapping in ADF Copy Activity to rename the column",
-            "Use a Derived Column transformation in Data Flow to sanitise names",
-            "Fix the column name at source (SQL view or CSV header)",
-            "Use wildcard mapping with column rename rule in ADF dataset",
+            "Use Derived Column in ADF Mapping Data Flow to sanitise column names",
+            "Apply sanitise_column_names() in data_processor.py before writing Parquet",
+            "Fix the column name at source — SQL view alias or CSV header",
         ],
         keywords=[
             "parquet", "invalid column name", "column name", "cannot contain",
             "characters", "parquetinvalidcolumnname", "bracket", "semicolon",
-            "special character", "copy data", "schema", "column",
+            "special character", "copy data", "column",
+            "[,;{}()", "hybriddeliveryexception", "microsoft.datatransfer",
         ],
         auto_resolvable=True,
         resolution_action="sanitise_parquet_column_names",
         severity="HIGH",
     ),
 
+    # ────────────────────────────────────────────────────────────────────────────
+    # ADD NEW ERRORS BELOW THIS LINE
+    # Follow the pattern above — increment to ADF-007, ADF-008, etc.
+    # ────────────────────────────────────────────────────────────────────────────
+
 ]
 
 
+# ── Helper functions ─────────────────────────────────────────────────────────
+
 def get_error_catalog_as_dict() -> List[Dict[str, Any]]:
-    """Return the catalog as a list of dicts (for LLM context injection)."""
+    """Return the full catalog as a list of dicts (injected into LLM context)."""
     return [
         {
             "error_code": e.error_code,
@@ -214,4 +244,5 @@ def get_error_catalog_as_dict() -> List[Dict[str, Any]]:
 
 
 def get_error_by_code(code: str) -> AdfError | None:
+    """Look up a single error by its ADF-XXX code."""
     return next((e for e in ADF_ERROR_CATALOG if e.error_code == code), None)
