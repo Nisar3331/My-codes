@@ -1,0 +1,94 @@
+name: CI / Deploy to Azure Functions
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  PYTHON_VERSION: "3.12"
+  AZURE_FUNCTIONAPP_NAME: adf-llm-datarend
+  AZURE_FUNCTIONAPP_PACKAGE_PATH: .
+
+jobs:
+  # ── Job 1: Run tests ──────────────────────────────────────────────────────
+  test:
+    name: Run unit tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ hashFiles('requirements.txt') }}
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pytest (mock mode — no Azure credentials needed)
+        run: pytest tests/ -v --tb=short
+
+  # ── Job 2: Deploy to Azure Functions (main branch only) ───────────────────
+  deploy:
+    name: Deploy to Azure Functions
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies into package
+        run: |
+          pip install -r requirements.txt --target=".python_packages/lib/site-packages"
+
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy to Azure Functions
+        uses: azure/functions-action@v1
+        with:
+          app-name: ${{ env.AZURE_FUNCTIONAPP_NAME }}
+          package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
+          scm-do-build-during-deployment: true
+          enable-oryx-build: true
+
+      - name: Set Azure Function App settings from secrets
+        uses: azure/appservice-settings@v1
+        with:
+          app-name: ${{ env.AZURE_FUNCTIONAPP_NAME }}
+          app-settings-json: |
+            [
+              { "name": "AZURE_SUBSCRIPTION_ID",        "value": "${{ secrets.AZURE_SUBSCRIPTION_ID }}" },
+              { "name": "AZURE_TENANT_ID",               "value": "${{ secrets.AZURE_TENANT_ID }}" },
+              { "name": "AZURE_CLIENT_ID",               "value": "${{ secrets.AZURE_CLIENT_ID }}" },
+              { "name": "AZURE_CLIENT_SECRET",           "value": "${{ secrets.AZURE_CLIENT_SECRET }}", "slotSetting": false },
+              { "name": "AZURE_RESOURCE_GROUP",          "value": "${{ secrets.AZURE_RESOURCE_GROUP }}" },
+              { "name": "ADF_FACTORY_NAME",              "value": "${{ secrets.ADF_FACTORY_NAME }}" },
+              { "name": "ADF_PIPELINE_NAME",             "value": "${{ secrets.ADF_PIPELINE_NAME }}" },
+              { "name": "AZURE_STORAGE_ACCOUNT",         "value": "${{ secrets.AZURE_STORAGE_ACCOUNT }}" },
+              { "name": "AZURE_STORAGE_KEY",             "value": "${{ secrets.AZURE_STORAGE_KEY }}", "slotSetting": false },
+              { "name": "AZURE_STORAGE_CONNECTION_STRING","value": "${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}", "slotSetting": false },
+              { "name": "AZURE_OPENAI_ENDPOINT",         "value": "${{ secrets.AZURE_OPENAI_ENDPOINT }}" },
+              { "name": "AZURE_OPENAI_API_KEY",          "value": "${{ secrets.AZURE_OPENAI_API_KEY }}", "slotSetting": false },
+              { "name": "AZURE_OPENAI_API_VERSION",      "value": "2024-02-15-preview" },
+              { "name": "LLM_DEPLOYMENT_NAME",           "value": "gpt-4o" }
+            ]
