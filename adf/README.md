@@ -1,5 +1,5 @@
 # ADF LLM Self-Healing ETL Pipeline
-**Munich RE × Capgemini DataRend Program — Use Case #1**
+
 
 > An intelligent Azure Data Factory ETL pipeline that automatically detects failures
 > using Azure AI Foundry (GPT-4o), resolves them, and restarts — deployed as Azure Functions.
