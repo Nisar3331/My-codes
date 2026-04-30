@@ -1,0 +1,32 @@
+# ============================================================
+#  ADF LLM Self-Healing ETL Pipeline — Dependencies
+#  Munich RE × Capgemini DataRend Program
+# ============================================================
+
+# ── Azure SDK ──────────────────────────────────────────────
+azure-mgmt-datafactory>=6.0.0         # ADF management (trigger, monitor, cancel)
+azure-storage-blob>=12.19.0           # ADLS Gen2 / Blob read/write
+azure-identity>=1.15.0                # ClientSecretCredential / DefaultAzureCredential
+azure-mgmt-resource>=23.0.0           # Resource group management
+
+# ── Azure AI Foundry / Azure OpenAI ───────────────────────
+openai>=1.30.0                        # Azure OpenAI client (supports azure_endpoint)
+
+# ── Data processing ────────────────────────────────────────
+pandas>=2.1.0                         # CSV parsing, DataFrame operations
+pyarrow>=14.0.0                       # Parquet serialisation / deserialisation
+fastparquet>=2024.2.0                 # Alternative Parquet engine (optional)
+
+# ── Utilities ──────────────────────────────────────────────
+python-dotenv>=1.0.0                  # Load .env for local development
+pydantic>=2.5.0                       # Config validation (optional enhancement)
+tenacity>=8.2.3                       # Retry decorator for resilient API calls
+rich>=13.7.0                          # Pretty console output (optional)
+
+# ── Logging & monitoring ───────────────────────────────────
+opencensus-ext-azure>=1.1.13          # Azure App Insights telemetry (optional)
+
+# ── Testing ────────────────────────────────────────────────
+pytest>=7.4.0
+pytest-asyncio>=0.23.0
+unittest-mock>=0.4.0
