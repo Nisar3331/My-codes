@@ -157,6 +157,40 @@ ADF_ERROR_CATALOG: List[AdfError] = [
         resolution_action="retry_sp_with_dedup_and_deadlock_handling",
         severity="HIGH",
     ),
+    AdfError(
+        error_code="ADF-006",
+        error_name="Parquet Invalid Column Name",
+        common_error_message=(
+            "The column name is invalid. Column name cannot contain "
+            "these characters: [,;{}()\\n\\t=]"
+        ),
+        main_cause=(
+            "Source data contains column names with special characters "
+            "that Parquet format does not allow: [,;{}()\\n\\t=]. "
+            "Common causes: SQL views with calculated columns, CSV files "
+            "with brackets in headers, or Excel exports with formula names."
+        ),
+        business_impact=(
+            "Copy activity fails before writing any data to the Parquet "
+            "landing folder. Downstream reports and transforms are blocked."
+        ),
+        troubleshooting_steps=[
+            "Identify which column name contains the invalid character",
+            "Add explicit column mapping in ADF Copy Activity to rename the column",
+            "Use a Derived Column transformation in Data Flow to sanitise names",
+            "Fix the column name at source (SQL view or CSV header)",
+            "Use wildcard mapping with column rename rule in ADF dataset",
+        ],
+        keywords=[
+            "parquet", "invalid column name", "column name", "cannot contain",
+            "characters", "parquetinvalidcolumnname", "bracket", "semicolon",
+            "special character", "copy data", "schema", "column",
+        ],
+        auto_resolvable=True,
+        resolution_action="sanitise_parquet_column_names",
+        severity="HIGH",
+    ),
+
 ]
 
 
