@@ -1,4 +1,4 @@
-adf-llm-datarend/
+adf/
 │
 ├── README.md                          ← setup, deploy, API docs
 ├── main.py                            ← CLI entry point
