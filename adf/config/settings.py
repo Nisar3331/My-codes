@@ -2,7 +2,14 @@
 =======================================================
   ADF LLM Pipeline Configuration
   Azure AI Foundry + ADF ETL Framework
-  Munich RE × Capgemini DataRend Program
+
+  NOTE on ADF_PIPELINE_NAME:
+  ──────────────────────────
+  This is now a DEFAULT FALLBACK only.
+  When the system is triggered by Event Grid, the
+  pipeline name comes from the event payload dynamically.
+  ADF_PIPELINE_NAME is only used when running manually
+  via CLI  (python main.py --mode full)
 =======================================================
 """
 
@@ -28,21 +35,28 @@ class AzureConfig:
 
     # ── Azure Data Factory ────────────────────────────────────────────────────
     adf_name: str = field(
-        default_factory=lambda: os.environ.get("ADF_FACTORY_NAME", "adf-datarend-poc")
+        default_factory=lambda: os.environ.get(
+            "ADF_FACTORY_NAME", "pf-observability-datafactory"
+        )
     )
+    # DEFAULT FALLBACK ONLY — runtime uses pipeline name from Event Grid payload
     adf_pipeline_name: str = field(
-        default_factory=lambda: os.environ.get("ADF_PIPELINE_NAME", "pl_csv_to_parquet_ingestion")
+        default_factory=lambda: os.environ.get("ADF_PIPELINE_NAME", "")
     )
 
     # ── Azure Storage (ADLS Gen2 / Blob) ─────────────────────────────────────
     storage_account_name: str = field(
-        default_factory=lambda: os.environ.get("AZURE_STORAGE_ACCOUNT", "stgdatarendpoc")
+        default_factory=lambda: os.environ.get(
+            "AZURE_STORAGE_ACCOUNT", "pfobservabilitystorage"
+        )
     )
     storage_account_key: str = field(
         default_factory=lambda: os.environ.get("AZURE_STORAGE_KEY", "")
     )
     storage_connection_string: str = field(
-        default_factory=lambda: os.environ.get("AZURE_STORAGE_CONNECTION_STRING", "")
+        default_factory=lambda: os.environ.get(
+            "AZURE_STORAGE_CONNECTION_STRING", ""
+        )
     )
     source_container: str = field(
         default_factory=lambda: os.environ.get("SOURCE_CONTAINER", "raw-data")
@@ -59,22 +73,21 @@ class AzureConfig:
 
     # ── Azure AI Foundry / Azure OpenAI ──────────────────────────────────────
     azure_openai_endpoint: str = field(
-        default_factory=lambda: os.environ.get(
-            "AZURE_OPENAI_ENDPOINT", "https://<your-foundry-resource>.openai.azure.com/"
-        )
+        default_factory=lambda: os.environ.get("AZURE_OPENAI_ENDPOINT", "")
     )
     azure_openai_api_key: str = field(
         default_factory=lambda: os.environ.get("AZURE_OPENAI_API_KEY", "")
     )
     azure_openai_api_version: str = field(
-        default_factory=lambda: os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
+        default_factory=lambda: os.environ.get(
+            "AZURE_OPENAI_API_VERSION", "2024-02-15-preview"
+        )
     )
-    # Deployment name inside Azure AI Foundry
     llm_deployment_name: str = field(
         default_factory=lambda: os.environ.get("LLM_DEPLOYMENT_NAME", "gpt-4o")
     )
 
-    # ── Service Principal (for ADF SDK auth) ─────────────────────────────────
+    # ── Service Principal ─────────────────────────────────────────────────────
     client_id: str = field(
         default_factory=lambda: os.environ.get("AZURE_CLIENT_ID", "")
     )
@@ -82,7 +95,7 @@ class AzureConfig:
         default_factory=lambda: os.environ.get("AZURE_CLIENT_SECRET", "")
     )
 
-    # ── Azure Key Vault (optional — for secret rotation) ─────────────────────
+    # ── Azure Key Vault ───────────────────────────────────────────────────────
     key_vault_url: Optional[str] = field(
         default_factory=lambda: os.environ.get("KEY_VAULT_URL", None)
     )
@@ -91,17 +104,16 @@ class AzureConfig:
 @dataclass
 class PipelineConfig:
     """ETL pipeline behaviour settings."""
-    max_retry_attempts: int = 3
-    retry_delay_seconds: int = 30
+    max_retry_attempts: int   = 3
+    retry_delay_seconds: int  = 30
     pipeline_timeout_minutes: int = 60
-    max_file_size_mb: int = 500
-    parquet_compression: str = "snappy"      # snappy | gzip | brotli
+    max_file_size_mb: int     = 500
+    parquet_compression: str  = "snappy"
     parquet_row_group_size: int = 100_000
-    log_level: str = "INFO"
-    log_file: str = "logs/pipeline_run.log"
-    enable_monitoring: bool = True
+    log_level: str            = "INFO"
+    log_file: str             = "logs/pipeline_run.log"
+    enable_monitoring: bool   = True
 
 
-# ── Global singletons ────────────────────────────────────────────────────────
-AZURE_CONFIG = AzureConfig()
+AZURE_CONFIG    = AzureConfig()
 PIPELINE_CONFIG = PipelineConfig()
