@@ -1,14 +1,16 @@
 """
 =======================================================
-  EventGridTrigger1 — ADF Self-Healing Function
-  Handles Azure Monitor Alert payload
+  HttpTrigger1 — Azure Monitor Alert Handler
   
-  Trigger: Azure Monitor Alert Rule → Action Group
-           → Azure Function (this file)
+  Called by: Azure Monitor → Alert Rule → Action Group
+             → Azure Function (this file)
   
   When ADF pipeline fails:
-    Monitor detects it → fires alert → calls this function
-    → LLM detects error → resolver fixes → pipeline restarts
+    1. Monitor detects failure
+    2. Alert fires → Action Group calls this HTTP endpoint
+    3. This code runs LLM detection
+    4. Auto-resolves the error
+    5. Restarts the failed pipeline
 =======================================================
 """
 
@@ -26,35 +28,43 @@ from src.adf_pipeline_manager import AdfPipelineManager
 from config.settings import AZURE_CONFIG
 
 
-def main(event: func.EventGridEvent) -> None:
+def main(req: func.HttpRequest) -> func.HttpResponse:
     """
-    Main entry point — handles both:
-    1. Azure Monitor Alert payload
-    2. ADF Event Grid payload (if Event Grid ever becomes available)
+    HTTP entry point called by Azure Monitor Action Group.
+    Azure Monitor sends a POST request with the alert payload.
     """
-    logging.info("=== EventGridTrigger1 fired ===")
+    logging.info("=== HttpTrigger1 — Monitor Alert received ===")
 
+    # ── Parse the request body ────────────────────────────────────────────────
     try:
-        data = event.get_json()
+        body = req.get_json()
     except Exception as exc:
-        logging.error("Failed to parse payload: %s", exc)
-        return
+        logging.error("Failed to parse request body: %s", exc)
+        return func.HttpResponse(
+            json.dumps({"error": "Invalid JSON body"}),
+            status_code=400,
+            mimetype="application/json",
+        )
 
-    logging.info("Raw payload: %s", json.dumps(data, default=str)[:500])
+    logging.info("Alert payload: %s", json.dumps(body, default=str)[:500])
 
-    # ── Detect payload type and extract pipeline info ─────────────────────────
-    pipeline_info = _extract_pipeline_info(data)
+    # ── Extract pipeline info from Monitor alert payload ──────────────────────
+    pipeline_info = _extract_from_monitor_payload(body)
 
     if not pipeline_info:
-        logging.info("Could not extract pipeline failure info — ignoring event")
-        return
+        logging.info("Could not extract pipeline info — ignoring alert")
+        return func.HttpResponse(
+            json.dumps({"status": "ignored", "reason": "no pipeline info found"}),
+            status_code=200,
+            mimetype="application/json",
+        )
 
     pipeline_name = pipeline_info["pipeline_name"]
     error_message = pipeline_info["error_message"]
     run_id        = pipeline_info.get("run_id", "unknown")
 
     logging.error(
-        "ADF FAILURE DETECTED | pipeline=%s | run_id=%s | error=%s",
+        "ADF FAILURE | pipeline=%s | run_id=%s | error=%s",
         pipeline_name, run_id, error_message[:200],
     )
 
@@ -97,6 +107,7 @@ def main(event: func.EventGridEvent) -> None:
         resolution = {"success": False}
 
     # ── Step 3: Restart pipeline ──────────────────────────────────────────────
+    restart_result = {}
     if detection.get("auto_resolvable", False) or resolution.get("success", False):
         logging.info("[%s] Restarting pipeline ...", pipeline_name)
         try:
@@ -105,99 +116,95 @@ def main(event: func.EventGridEvent) -> None:
                 pipeline_name=pipeline_name,
                 delay_seconds=30,
             )
+            restart_result = {"restarted": True, "new_run_id": new_run_id}
             logging.info(
                 "[%s] RESTARTED SUCCESSFULLY | new_run_id=%s",
                 pipeline_name, new_run_id,
             )
         except Exception as exc:
+            restart_result = {"restarted": False, "error": str(exc)}
             logging.error("[%s] Restart failed: %s", pipeline_name, exc)
     else:
+        restart_result = {"restarted": False, "reason": "not_auto_resolvable"}
         logging.error(
             "[%s] Not auto-resolvable — manual intervention required",
             pipeline_name,
         )
 
+    # ── Return result ─────────────────────────────────────────────────────────
+    result = {
+        "pipeline_name": pipeline_name,
+        "detection":     detection.get("matched_error_code"),
+        "confidence":    detection.get("confidence", 0),
+        "resolved":      resolution.get("success"),
+        "restart":       restart_result,
+    }
 
-def _extract_pipeline_info(data: dict) -> dict | None:
+    logging.info("[%s] Complete: %s", pipeline_name, json.dumps(result))
+
+    return func.HttpResponse(
+        json.dumps(result, default=str),
+        status_code=200,
+        mimetype="application/json",
+    )
+
+
+def _extract_from_monitor_payload(data: dict) -> dict | None:
     """
-    Auto-detects payload format and extracts pipeline info.
-    Handles 3 formats:
-      1. Azure Monitor Common Alert Schema
-      2. ADF Event Grid payload
-      3. Direct ADF Monitor payload
+    Extract pipeline name and error from Azure Monitor alert payload.
+    
+    Azure Monitor Common Alert Schema:
+    {
+      "schemaId": "azureMonitorCommonAlertSchema",
+      "data": {
+        "essentials": {
+          "alertRule": "adf-pipeline-failure-alert",
+          "monitorCondition": "Fired",
+          "affectedConfigurationItems": ["pf-observability-datafactory"]
+        },
+        "alertContext": {
+          "properties": {
+            "pipelineName": "pipeline22",
+            "runId": "abc-123",
+            "errorMessage": "Copy activity failed..."
+          }
+        }
+      }
+    }
     """
+    # Handle wrapped {"data": {...}} format
+    payload = data.get("data", data)
 
-    # ── Format 1: Azure Monitor Common Alert Schema ───────────────────────────
-    # Sent when Azure Monitor Alert Rule fires via Action Group
-    if "data" in data and "essentials" in data.get("data", {}):
-        essentials    = data["data"]["essentials"]
-        alert_context = data["data"].get("alertContext", {})
-        properties    = alert_context.get("properties", {})
+    essentials    = payload.get("essentials", {})
+    alert_context = payload.get("alertContext", {})
+    properties    = alert_context.get("properties", {})
 
-        # Skip if alert is resolved (not fired)
-        if essentials.get("monitorCondition") == "Resolved":
-            logging.info("Monitor alert resolved — ignoring")
-            return None
+    # Skip resolved alerts
+    if essentials.get("monitorCondition") == "Resolved":
+        logging.info("Alert resolved — ignoring")
+        return None
 
-        pipeline_name = (
-            properties.get("pipelineName") or
-            properties.get("PipelineName") or
-            AZURE_CONFIG.adf_pipeline_name or
-            "unknown-pipeline"
-        )
-        error_message = (
-            properties.get("errorMessage") or
-            properties.get("message") or
-            f"Pipeline failure detected by Azure Monitor alert: {essentials.get('alertRule', '')}"
-        )
-        return {
-            "pipeline_name": pipeline_name,
-            "error_message": error_message,
-            "run_id":        properties.get("runId", "unknown"),
-            "source":        "azure_monitor",
-        }
+    # Get pipeline name from properties or use default
+    pipeline_name = (
+        properties.get("pipelineName") or
+        properties.get("PipelineName") or
+        properties.get("pipeline_name") or
+        AZURE_CONFIG.adf_pipeline_name or
+        "unknown-pipeline"
+    )
 
-    # ── Format 2: ADF Event Grid payload ─────────────────────────────────────
-    # Sent when ADF Event Grid subscription fires
-    if "pipelineName" in data or "status" in data:
-        status = data.get("status", "")
-        if status and status != "Failed":
-            logging.info("ADF event status=%s — ignoring", status)
-            return None
+    # Get error message
+    error_message = (
+        properties.get("errorMessage") or
+        properties.get("message") or
+        properties.get("ErrorMessage") or
+        f"ADF pipeline failure — alert: {essentials.get('alertRule', 'unknown')}"
+    )
 
-        pipeline_name = (
-            data.get("pipelineName") or
-            AZURE_CONFIG.adf_pipeline_name or
-            "unknown-pipeline"
-        )
-        error_obj     = data.get("error", {})
-        error_message = (
-            error_obj.get("message") or
-            error_obj.get("errorCode") or
-            "ADF pipeline failed"
-        )
-        return {
-            "pipeline_name": pipeline_name,
-            "error_message": error_message,
-            "run_id":        data.get("runId", "unknown"),
-            "source":        "event_grid",
-        }
-
-    # ── Format 3: Direct Monitor payload ─────────────────────────────────────
-    # Some alert rules send simpler payloads
-    if "context" in data:
-        context = data.get("context", {})
-        return {
-            "pipeline_name": (
-                context.get("resourceName") or
-                AZURE_CONFIG.adf_pipeline_name or
-                "unknown-pipeline"
-            ),
-            "error_message": f"Pipeline failure from Monitor context: {json.dumps(context)[:200]}",
-            "run_id":        "unknown",
-            "source":        "monitor_direct",
-        }
-
-    logging.warning("Unknown payload format — logging for analysis: %s",
-                    json.dumps(data, default=str)[:300])
-    return None
+    return {
+        "pipeline_name": pipeline_name,
+        "error_message": error_message,
+        "run_id":        properties.get("runId", "unknown"),
+        "alert_rule":    essentials.get("alertRule", ""),
+        "source":        "azure_monitor",
+    }
