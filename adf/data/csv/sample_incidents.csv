@@ -1,0 +1,6 @@
+incident_id,title,application,severity,status,created_date,resolved_date,resolution_notes
+INC001,App login failure,AuthService,P1,Resolved,2024-01-10,2024-01-10,Restarted auth pod; root cause was expired cert
+INC002,Database timeout,OrdersDB,P2,Resolved,2024-01-11,2024-01-12,Increased connection pool size from 10 to 50
+INC003,Data pipeline stuck,ETL-Jobs,P2,Resolved,2024-01-12,2024-01-12,Cleared stale lock file in ADLS; restarted pipeline
+INC004,API 500 errors,PaymentAPI,P1,Resolved,2024-01-13,2024-01-13,Rolled back deployment v2.3.1 to v2.3.0
+INC005,Report not loading,ReportingUI,P3,Resolved,2024-01-14,2024-01-15,Cleared browser cache; updated CDN config

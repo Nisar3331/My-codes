@@ -1,0 +1,38 @@
+adf/
+│
+├── README.md                          ← setup, deploy, API docs
+├── main.py                            ← CLI entry point
+├── host.json                          ← Azure Functions runtime config
+├── requirements.txt                   ← pip dependencies
+├── .gitignore                         ← blocks .env, logs, data, __pycache__
+├── .env.template                      ← commit this (no secrets)
+├── local.settings.json.template       ← Azure Functions local dev config
+│
+├── config/
+│   └── settings.py                    ← AzureConfig + PipelineConfig
+│
+├── src/                               ← core business logic
+│   ├── error_catalog.py               ← 5 ADF error types + keywords
+│   ├── data_processor.py              ← CSV → Parquet
+│   ├── llm_error_detector.py          ← GPT-4o error classifier
+│   ├── error_resolver.py              ← 5 auto-resolution handlers
+│   ├── adf_pipeline_manager.py        ← trigger / monitor / restart
+│   ├── pipeline_orchestrator.py       ← full run + retry loop
+│   └── logger.py                      ← rotating file + console logger
+│
+├── functions/                         ← Azure Function entry points
+│   ├── timer_trigger_fn.py            ← 6 AM daily schedule
+│   ├── event_trigger_fn.py            ← fires on ADF failure (Event Grid)
+│   └── http_trigger_fn.py             ← /run-pipeline  /detect-error  /health
+│
+├── tests/
+│   └── test_pipeline.py               ← 33 unit tests (mock mode)
+│
+├── data/
+│   └── csv/sample_incidents.csv       ← sample input for local testing
+│
+├── infra/
+│   └── main.bicep                     ← IaC — provisions ADF, Functions, Storage
+│
+└── .github/workflows/
+    └── ci.yml                         ← pytest on PR + deploy to Azure on main
